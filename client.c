@@ -13,17 +13,16 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
+#include <time.h>          /* ← ДОБАВЛЕНО */
 
 static struct tunnel_ctx g_ctx;
 
-/* ── Обработчик сигналов ──────────────────────────────────────────── */
 static void signal_handler(int sig)
 {
     (void)sig;
     g_ctx.running = false;
 }
 
-/* ── Отправка UDP-датаграммы ──────────────────────────────────────── */
 static int udp_send(const struct sockaddr_in *dst,
                     const uint8_t *data, size_t len)
 {
@@ -36,7 +35,6 @@ static int udp_send(const struct sockaddr_in *dst,
     return 0;
 }
 
-/* ── Отправка MSG_DATA ────────────────────────────────────────────── */
 static int send_data_packet(const uint8_t *ip_pkt, size_t len)
 {
     struct session *s = &g_ctx.sess;
@@ -45,11 +43,9 @@ static int send_data_packet(const uint8_t *ip_pkt, size_t len)
     uint8_t buf[MAX_UDP_PACKET];
     size_t offset = 0;
 
-    /* Заголовок */
     proto_write_header(buf, MSG_DATA, s->session_id, s->tx_seq);
     offset += HEADER_SIZE;
 
-    /* Шифрование */
     uint8_t *nonce = buf + offset;
     size_t ct_len = 0;
 
@@ -73,7 +69,6 @@ static int send_data_packet(const uint8_t *ip_pkt, size_t len)
     return 0;
 }
 
-/* ── Отправка служебного сообщения ────────────────────────────────── */
 static int send_control(uint8_t type)
 {
     struct session *s = &g_ctx.sess;
@@ -101,7 +96,6 @@ static int send_control(uint8_t type)
     return 0;
 }
 
-/* ── Обработка входящего UDP ──────────────────────────────────────── */
 static void handle_udp_recv(void)
 {
     uint8_t buf[MAX_UDP_PACKET];
@@ -112,7 +106,6 @@ static void handle_udp_recv(void)
                          (struct sockaddr *)&from, &from_len);
     if (n <= 0) return;
 
-    /* Разбор заголовка */
     struct packet_header hdr;
     if (proto_parse_header(buf, (size_t)n, &hdr) != 0) {
         log_msg("WARN: invalid packet header");
@@ -122,24 +115,20 @@ static void handle_udp_recv(void)
 
     struct session *s = &g_ctx.sess;
 
-    /* Обработка рукопожатия */
     if (hdr.type == MSG_INIT_ACK && s->state == SESS_WAIT_ACK) {
         handshake_client_process_ack(&g_ctx, buf, (size_t)n);
         return;
     }
 
-    /* Проверка сессии */
     if (s->state != SESS_ESTABLISHED) return;
     if (hdr.session_id != s->session_id) return;
 
-    /* Анти-повтор */
     if (replay_check(&s->rx_window, hdr.seq) != 0) {
         log_msg("WARN: replay detected, seq=%lu", hdr.seq);
         g_ctx.pkts_dropped++;
         return;
     }
 
-    /* Расшифровка */
     const uint8_t *nonce = buf + HEADER_SIZE;
     const uint8_t *ct = buf + HEADER_SIZE + NONCE_SIZE;
     size_t ct_len = (size_t)n - HEADER_SIZE - NONCE_SIZE;
@@ -177,7 +166,6 @@ static void handle_udp_recv(void)
                 break;
             case MSG_REKEY:
                 log_msg("Rekey requested by peer");
-                /* В прототипе: просто логируем */
                 break;
             default:
                 log_msg("WARN: unknown message type %d", hdr.type);
@@ -185,7 +173,6 @@ static void handle_udp_recv(void)
         }
 }
 
-/* ── Обработка TUN (чтение → шифрование → отправка) ──────────────── */
 static void handle_tun_read(void)
 {
     uint8_t buf[MAX_IP_PACKET];
@@ -203,8 +190,9 @@ int handshake_client_init(struct tunnel_ctx *ctx,
 {
     struct session *s = &ctx->sess;
 
-    /* Генерация ключей X25519 */
-    crypto_scalarmult_keypair(s->my_x25519_pub, s->my_x25519_priv);
+    /* ── ИСПРАВЛЕНИЕ: генерация пары X25519 ── */
+    randombytes_buf(s->my_x25519_priv, X25519_PRIV_SIZE);
+    crypto_scalarmult_base(s->my_x25519_pub, s->my_x25519_priv);
     randombytes_buf(s->my_random, RANDOM_SIZE);
 
     /* Генерация session_id */
@@ -260,11 +248,9 @@ int handshake_client_process_ack(struct tunnel_ctx *ctx,
 {
     struct session *s = &ctx->sess;
 
-    /* Разбор заголовка уже выполнен вызывающим */
     struct packet_header hdr;
     if (proto_parse_header(buf, len, &hdr) != 0) return -1;
 
-    /* Расшифровка */
     uint8_t psk_key[KEY_SIZE];
     crypto_derive_psk_key(ctx->psk, psk_key);
 
@@ -286,13 +272,11 @@ int handshake_client_process_ack(struct tunnel_ctx *ctx,
             return -1;
         }
 
-        /* Проверка HMAC */
         if (!crypto_hmac_verify(ctx->psk, payload, 66, payload + 66)) {
             log_msg("ERROR: INIT_ACK HMAC verification failed");
             return -1;
         }
 
-        /* Извлечение данных сервера */
         uint8_t server_pub[X25519_PUB_SIZE];
         uint8_t server_random[RANDOM_SIZE];
         uint16_t chosen_suite;
@@ -302,21 +286,17 @@ int handshake_client_process_ack(struct tunnel_ctx *ctx,
         memcpy(&chosen_suite, payload + 64, 2);
         chosen_suite = le16toh(chosen_suite);
 
-        /* Вычисление общего секрета */
         uint8_t shared[X25519_PUB_SIZE];
         if (crypto_scalarmult(shared, s->my_x25519_priv, server_pub) != 0) {
             log_msg("ERROR: X25519 shared secret computation failed");
             return -1;
         }
 
-        /* Выбор набора шифров */
         s->suite = (enum cipher_suite)chosen_suite;
 
-        /* Вывод сессионных ключей */
         crypto_derive_session_keys(shared, s->my_random, server_random,
                                    ctx->psk, false, s);
 
-        /* Очистка */
         sodium_memzero(shared, sizeof(shared));
         sodium_memzero(s->my_x25519_priv, sizeof(s->my_x25519_priv));
 
@@ -331,7 +311,6 @@ int handshake_client_process_ack(struct tunnel_ctx *ctx,
         return 0;
 }
 
-/* ── Главный цикл ─────────────────────────────────────────────────── */
 static void event_loop(void)
 {
     time_t last_keepalive = time(NULL);
@@ -355,7 +334,6 @@ static void event_loop(void)
             if (fds[1].revents & POLLIN) handle_udp_recv();
         }
 
-        /* Keepalive */
         time_t now = time(NULL);
         if (g_ctx.sess.state == SESS_ESTABLISHED &&
             now - last_keepalive >= KEEPALIVE_INTERVAL_SEC) {
@@ -363,7 +341,6 @@ static void event_loop(void)
         last_keepalive = now;
             }
 
-            /* Таймаут сессии */
             if (g_ctx.sess.state == SESS_ESTABLISHED &&
                 now - g_ctx.sess.last_activity > SESSION_TIMEOUT_SEC) {
                 log_msg("Session timeout, closing");
@@ -373,7 +350,6 @@ static void event_loop(void)
     }
 }
 
-/* ── main ─────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[])
 {
     const char *server_ip = "127.0.0.1";
@@ -411,73 +387,63 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Инициализация */
     if (crypto_init() != 0) return 1;
 
     memset(&g_ctx, 0, sizeof(g_ctx));
     g_ctx.is_server = false;
     g_ctx.running = true;
 
-    /* Парсинг PSK из hex */
     if (sodium_hex2bin(g_ctx.psk, PSK_SIZE, psk_hex, strlen(psk_hex),
         NULL, NULL, NULL) != 0) {
         fprintf(stderr, "ERROR: invalid PSK hex\n");
     return 1;
         }
 
-        /* Сигналы */
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
 
-        /* TUN */
         g_ctx.tun_fd = tun_alloc(tun_name);
         if (g_ctx.tun_fd < 0) return 1;
         if (tun_set_ip(g_ctx.tun_fd, tun_ip) != 0) return 1;
 
-        /* UDP-сокет */
         g_ctx.udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (g_ctx.udp_fd < 0) {
-            perror("socket");
-            return 1;
-        }
-
-        /* Адрес сервера */
-        struct sockaddr_in server_addr;
-        memset(&server_addr, 0, sizeof(server_addr));
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons((uint16_t)server_port);
-        if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) != 1) {
-            fprintf(stderr, "ERROR: invalid server IP '%s'\n", server_ip);
-            return 1;
-        }
-
-        /* Привязка к локальному порту */
-        struct sockaddr_in bind_addr = {0};
-        bind_addr.sin_family = AF_INET;
-        bind_addr.sin_addr.s_addr = INADDR_ANY;
-        bind_addr.sin_port = 0;
-        if (bind(g_ctx.udp_fd, (struct sockaddr *)&bind_addr,
-            sizeof(bind_addr)) < 0) {
-            perror("bind");
+    if (g_ctx.udp_fd < 0) {
+        perror("socket");
         return 1;
-            }
+    }
 
-            log_msg("Client starting: server=%s:%d tun=%s tun_ip=%s",
-                    server_ip, server_port, tun_name, tun_ip);
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons((uint16_t)server_port);
+    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) != 1) {
+        fprintf(stderr, "ERROR: invalid server IP '%s'\n", server_ip);
+        return 1;
+    }
 
-            /* Рукопожатие */
-            if (handshake_client_init(&g_ctx, &server_addr) != 0) {
-                fprintf(stderr, "ERROR: handshake init failed\n");
-                return 1;
-            }
+    struct sockaddr_in bind_addr = {0};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
+    bind_addr.sin_port = 0;
+    if (bind(g_ctx.udp_fd, (struct sockaddr *)&bind_addr,
+        sizeof(bind_addr)) < 0) {
+        perror("bind");
+    return 1;
+        }
 
-            /* Главный цикл */
-            event_loop();
+        log_msg("Client starting: server=%s:%d tun=%s tun_ip=%s",
+                server_ip, server_port, tun_name, tun_ip);
 
-            /* Завершение */
-            log_msg("Client shutting down. TX=%lu RX=%lu dropped=%lu",
-                    g_ctx.pkts_tx, g_ctx.pkts_rx, g_ctx.pkts_dropped);
-            close(g_ctx.tun_fd);
-            close(g_ctx.udp_fd);
-            return 0;
+        if (handshake_client_init(&g_ctx, &server_addr) != 0) {
+            fprintf(stderr, "ERROR: handshake init failed\n");
+            return 1;
+        }
+
+        event_loop();
+
+        log_msg("Client shutting down. TX=%lu RX=%lu dropped=%lu",
+                g_ctx.pkts_tx, g_ctx.pkts_rx, g_ctx.pkts_dropped);
+        close(g_ctx.tun_fd);
+        close(g_ctx.udp_fd);
+        return 0;
 }

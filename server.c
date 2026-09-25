@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
+#include <time.h>          /* ← ДОБАВЛЕНО */
 
 static struct tunnel_ctx g_ctx;
 
@@ -30,7 +31,6 @@ static int udp_send_to(const struct sockaddr_in *dst,
     return (n < 0) ? -1 : 0;
 }
 
-/* ── Отправка данных клиенту ──────────────────────────────────────── */
 static int send_data_packet(const uint8_t *ip_pkt, size_t len)
 {
     struct session *s = &g_ctx.sess;
@@ -133,7 +133,7 @@ int handshake_server_process_init(struct tunnel_ctx *ctx,
         client_suites = le32toh(client_suites);
 
         /* Выбор набора шифров */
-        uint16_t chosen = SUITE_CHACHA20_POLY1305;  /* по умолчанию */
+        uint16_t chosen = SUITE_CHACHA20_POLY1305;
         if ((client_suites & SUITE_BIT_AESGCM) &&
             crypto_aead_aes256gcm_is_available()) {
             chosen = SUITE_AES_256_GCM;
@@ -142,8 +142,9 @@ int handshake_server_process_init(struct tunnel_ctx *ctx,
                 return -1;
             }
 
-            /* Генерация ключей сервера */
-            crypto_scalarmult_keypair(s->my_x25519_pub, s->my_x25519_priv);
+            /* ── ИСПРАВЛЕНИЕ: генерация пары X25519 ── */
+            randombytes_buf(s->my_x25519_priv, X25519_PRIV_SIZE);
+        crypto_scalarmult_base(s->my_x25519_pub, s->my_x25519_priv);
         randombytes_buf(s->my_random, RANDOM_SIZE);
 
         /* Общий секрет */
